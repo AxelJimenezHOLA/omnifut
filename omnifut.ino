@@ -1,3 +1,8 @@
+// =============================================================================
+//  RobofutOreo — Control manual BLE mediante RemoteXY + PID por encoder (ESP32)
+//  Fuente de comandos: botones RemoteXY  → omniDrive() → PID → PWM
+// =============================================================================
+
 #include <Adafruit_NeoPixel.h>
 
 // =============================================================================
@@ -6,41 +11,32 @@
 #define PIN_PUSH      45
 #define PIN_BATTERY    9
 #define PIN_LED        3
-#define PIN_STM_RX    15
-#define PIN_STM_TX    16
 
 // =============================================================================
 //  Configuración PWM
 // =============================================================================
-#define PWM_MAX        200     // Límite superior de PWM (0–255 a 8 bits)
+#define PWM_MAX        255
 #define PWM_FREQUENCY 4000
 #define PWM_RESOLUTION   8
 
 // =============================================================================
 //  Parámetros cinemáticos y de encoder — ajustar según hardware real
 // =============================================================================
-#define RPM_MAX          300.0f   // RPM máximas del motor a PWM_MAX
-#define PPR               20      // Pulsos por revolución del encoder (solo canal A)
-#define PID_INTERVAL_MS   20      // Período de actualización PID en ms
+#define RPM_MAX         1000.0f   // RPM máximas del motor a PWM_MAX
+#define PPR              200      // Pulsos por revolución del encoder (canal A)
+#define PID_INTERVAL_MS   20     // Período de actualización PID en ms
 
 // =============================================================================
-//  Tiempos y velocidades de la máquina de estados
+//  Velocidad de traslación manual (fracción de RPM_MAX, rango 0–1)
 // =============================================================================
-#define TIME_ADVANCE_MS   2000
-#define TIME_REVERSE_MS   1000
-
-#define SPEED_ADVANCE     0.40f
-#define SPEED_REVERSE     0.40f
-#define SPEED_SEARCH      0.18f
+#define SPEED_MANUAL    0.60f
 
 // =============================================================================
 //  Colores LED
 // =============================================================================
-#define COLOR_SEARCH   pixels.Color(  0,   0, 150)
-#define COLOR_ADVANCE  pixels.Color(  0, 150,   0)
-#define COLOR_REVERSE  pixels.Color(150,   0,   0)
-#define COLOR_IDLE     pixels.Color( 50,  50,  50)
-#define COLOR_READY    pixels.Color(  0, 150,   0)
+#define COLOR_IDLE     pixels.Color( 50,  50,  50)   // blanco tenue — toggle OFF
+#define COLOR_READY    pixels.Color(  0, 150,   0)   // verde — toggle ON, quieto
+#define COLOR_MOVING   pixels.Color(  0,   0, 150)   // azul — en movimiento
 
 // =============================================================================
 //  Número de motores
@@ -56,7 +52,7 @@ struct MotorPID {
     float integral;
     float previousError;
     int   pwmOutput;
-    volatile long encoderCount;   // modificado en ISR
+    volatile long encoderCount;    // modificado en ISR
     long  lastEncoderCount;
     unsigned long lastUpdateTime;
     float kp;
@@ -70,9 +66,9 @@ struct MotorPID {
 struct Motor {
     uint8_t pwmP;
     uint8_t pwmN;
-    uint8_t encoderA;   // canal A (interrupción)
-    uint8_t encoderB;   // canal B (dirección, opcional)
-    bool    invertDir;  // true = invertir signo de velocidad objetivo
+    uint8_t encoderA;    // canal A (interrupción)
+    uint8_t encoderB;    // canal B (dirección, opcional)
+    bool    invertDir;   // true = invertir signo de velocidad objetivo
     MotorPID pid;
 };
 
@@ -81,11 +77,10 @@ enum MotorIndex { FRONT_LEFT = 0, FRONT_RIGHT, BACK_RIGHT, BACK_LEFT };
 
 // =============================================================================
 //  Definición centralizada de motores
-//  Ajustar encoderA/B según los pines físicos del ESP32 conectados al encoder.
-//  Los pines de encoder deben ser GPIO con capacidad de interrupción.
+//  Ajustar encoderA/B según pines físicos del ESP32 con capacidad de interrupción
 // =============================================================================
 static Motor motors[MOTOR_COUNT] = {
-    // pwmP  pwmN  encA  encB  invertDir  pid (inicializado abajo)
+    // pwmP  pwmN  encA  encB  invertDir  pid (kp, ki, kd)
     {  1,    2,    4,    5,    false,  {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // FRONT_LEFT
     {  6,    7,    19,   21,   true,   {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // FRONT_RIGHT
     { 17,   18,    22,   23,   true,   {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // BACK_RIGHT
@@ -93,7 +88,7 @@ static Motor motors[MOTOR_COUNT] = {
 };
 
 // =============================================================================
-//  ISR de encoders (una por motor, referencia al contador del arreglo)
+//  ISR de encoders — una por motor, solo incrementa el contador
 // =============================================================================
 static void IRAM_ATTR isr_enc0() { motors[0].pid.encoderCount++; }
 static void IRAM_ATTR isr_enc1() { motors[1].pid.encoderCount++; }
@@ -105,31 +100,8 @@ static void (*const ENCODER_ISRS[MOTOR_COUNT])() = {
 };
 
 // =============================================================================
-//  Datos recibidos del STM32
-// =============================================================================
-struct StmData {
-    bool    ballFound = false;
-    int16_t ballCx    = 0;
-    int16_t ballCy    = 0;
-    bool    sideFound = false;
-    uint8_t sideId    = 0;
-    int16_t sideCx    = 0;
-    int16_t sideCy    = 0;
-};
-static StmData stm;
-
-// =============================================================================
-//  Máquina de estados del robot
-// =============================================================================
-enum RobotState { STATE_SEARCH, STATE_ADVANCE, STATE_REVERSE };
-static RobotState    currentState = STATE_SEARCH;
-static unsigned long stateTimer   = 0;
-static bool          robotRunning = false;
-
-// =============================================================================
 //  Periféricos
 // =============================================================================
-HardwareSerial stmSerial(1);
 Adafruit_NeoPixel pixels(1, PIN_LED, NEO_GRB + NEO_KHZ800);
 
 // ── RemoteXY (BLE) ────────────────────────────────────────────────────────────
@@ -139,12 +111,21 @@ Adafruit_NeoPixel pixels(1, PIN_LED, NEO_GRB + NEO_KHZ800);
 #include <RemoteXY.h>
 
 #pragma pack(push, 1)
-uint8_t const PROGMEM RemoteXY_CONF_PROGMEM[] = {
-    255,1,0,0,0,41,0,19,0,0,0,82,111,98,111,102,117,116,79,114,
-    101,111,0,31,1,106,200,1,1,1,0,10,5,76,96,93,49,4,26,31,
-    79,78,0,31,79,70,70,0
-};
-struct { uint8_t button_01; uint8_t connect_flag; } RemoteXY;
+uint8_t const PROGMEM RemoteXY_CONF_PROGMEM[] =   // 96 bytes V19
+  { 255,5,0,0,0,89,0,19,0,0,0,82,111,98,111,102,117,116,79,114,
+  101,111,0,29,1,106,200,1,1,5,0,10,5,152,97,41,49,4,26,31,
+  79,78,0,31,79,70,70,0,1,41,59,24,24,1,192,31,226,134,145,0,
+  1,15,86,24,24,1,192,31,226,134,144,0,1,67,86,24,24,1,192,31,
+  226,134,146,0,1,41,112,24,24,1,192,31,226,134,147,0 };
+
+struct {
+    uint8_t button_toggle;  // =1 si está ON, =0 si OFF
+    uint8_t button_up;      // =1 mientras se mantiene pulsado
+    uint8_t button_left;
+    uint8_t button_right;
+    uint8_t button_down;
+    uint8_t connect_flag;   // =1 si BLE conectado
+} RemoteXY;
 #pragma pack(pop)
 
 // =============================================================================
@@ -166,9 +147,9 @@ static void initMotors() {
         attachInterrupt(digitalPinToInterrupt(m.encoderA), ENCODER_ISRS[i], RISING);
 
         // Estado PID inicial
-        m.pid.encoderCount    = 0;
+        m.pid.encoderCount     = 0;
         m.pid.lastEncoderCount = 0;
-        m.pid.lastUpdateTime  = millis();
+        m.pid.lastUpdateTime   = millis();
     }
 }
 
@@ -183,11 +164,11 @@ static void applyMotorPWM(Motor& m, int pwm) {
 
 // =============================================================================
 //  Actualización PID de un motor individual
-//  Llamar cada PID_INTERVAL_MS.
+//  Llamar cada PID_INTERVAL_MS
 // =============================================================================
 static void updateMotorPID(Motor& m) {
-    unsigned long now      = millis();
-    float dt               = (now - m.pid.lastUpdateTime) / 1000.0f;
+    unsigned long now = millis();
+    float dt          = (now - m.pid.lastUpdateTime) / 1000.0f;
     if (dt <= 0.0f) return;
 
     // Captura atómica del contador (evitar glitch con ISR activa)
@@ -196,7 +177,7 @@ static void updateMotorPID(Motor& m) {
     encNow = m.pid.encoderCount;
     interrupts();
 
-    long deltaTicks  = encNow - m.pid.lastEncoderCount;
+    long deltaTicks        = encNow - m.pid.lastEncoderCount;
     m.pid.lastEncoderCount = encNow;
     m.pid.lastUpdateTime   = now;
 
@@ -211,7 +192,7 @@ static void updateMotorPID(Motor& m) {
     m.pid.integral  = constrain(m.pid.integral, -RPM_MAX, RPM_MAX);
 
     // Término derivativo
-    float derivative = (error - m.pid.previousError) / dt;
+    float derivative    = (error - m.pid.previousError) / dt;
     m.pid.previousError = error;
 
     // Salida PID → escalar a rango PWM
@@ -263,30 +244,6 @@ static void omniDrive(float vx, float vy, float w) {
 static void stopMotors() { omniDrive(0.0f, 0.0f, 0.0f); }
 
 // =============================================================================
-//  Lectura del STM32 (protocolo: 0xAA 0xBB + 12 bytes + checksum)
-// =============================================================================
-static void readStm32() {
-    if (stmSerial.available() < 14) return;
-
-    uint8_t buf[14];
-    stmSerial.readBytes(buf, 14);
-
-    if (buf[0] != 0xAA || buf[1] != 0xBB) { stmSerial.read(); return; }
-
-    uint8_t checksum = 0;
-    for (int i = 0; i < 13; i++) checksum += buf[i];
-    if (checksum != buf[13]) { Serial.println("ERROR: checksum STM32"); return; }
-
-    stm.ballFound = buf[2];
-    stm.ballCx    = (int16_t)((buf[3]  << 8) | buf[4]);
-    stm.ballCy    = (int16_t)((buf[5]  << 8) | buf[6]);
-    stm.sideId    = buf[7];
-    stm.sideFound = buf[8];
-    stm.sideCx    = (int16_t)((buf[9]  << 8) | buf[10]);
-    stm.sideCy    = (int16_t)((buf[11] << 8) | buf[12]);
-}
-
-// =============================================================================
 //  Helpers de LED
 // =============================================================================
 static void setLed(uint32_t color) {
@@ -295,11 +252,24 @@ static void setLed(uint32_t color) {
 }
 
 // =============================================================================
+//  Leer botones de dirección → vx, vy
+//  Los botones son momentáneos: se activan mientras se mantienen pulsados.
+//  Múltiples botones simultáneos se combinan (ej. UP+RIGHT = diagonal).
+// =============================================================================
+static void readDirectionButtons(float& vx, float& vy) {
+    vx = 0.0f;
+    vy = 0.0f;
+    if (RemoteXY.button_up)    vx += SPEED_MANUAL;
+    if (RemoteXY.button_down)  vx -= SPEED_MANUAL;
+    if (RemoteXY.button_right) vy += SPEED_MANUAL;
+    if (RemoteXY.button_left)  vy -= SPEED_MANUAL;
+}
+
+// =============================================================================
 //  SETUP
 // =============================================================================
 void setup() {
     Serial.begin(115200);
-    stmSerial.begin(115200, SERIAL_8N1, PIN_STM_RX, PIN_STM_TX);
     RemoteXY_Init();
     delay(500);
 
@@ -308,62 +278,30 @@ void setup() {
 
     pixels.begin();
     pixels.clear();
-    setLed(COLOR_READY);
+    setLed(COLOR_IDLE);
 }
 
 // =============================================================================
 //  LOOP
 // =============================================================================
 void loop() {
-    readStm32();
-    RemoteXYEngine.handler();
+    RemoteXYEngine.Handler();
 
-    float vx = 0.0f, vy = 0.0f, w = 0.0f;
+    float vx = 0.0f, vy = 0.0f;
 
-    // ── Botón BLE: toggle ─────────────────────────────────────────────────────
-    bool wasRunning = robotRunning;
-    robotRunning = RemoteXY.connect_flag && (RemoteXY.button_01 == 1);
-    if (wasRunning && !robotRunning) currentState = STATE_SEARCH;
+    if (RemoteXY.connect_flag && RemoteXY.button_toggle) {
+        // ── Toggle ON: leer botones y mover ──────────────────────────────────
+        readDirectionButtons(vx, vy);
 
-    // ── Máquina de estados ────────────────────────────────────────────────────
-    if (robotRunning) {
-        switch (currentState) {
-
-            case STATE_SEARCH:
-                w = SPEED_SEARCH;
-                if (stm.ballFound) {
-                    currentState = STATE_ADVANCE;
-                    stateTimer   = millis();
-                    Serial.println("Pelota detectada → AVANZAR 2s");
-                }
-                break;
-
-            case STATE_ADVANCE:
-                vx = SPEED_ADVANCE;
-                if (millis() - stateTimer >= TIME_ADVANCE_MS) {
-                    currentState = STATE_REVERSE;
-                    stateTimer   = millis();
-                    Serial.println("2s cumplidos → RETROCEDER 1s");
-                }
-                break;
-
-            case STATE_REVERSE:
-                vx = -SPEED_REVERSE;
-                if (millis() - stateTimer >= TIME_REVERSE_MS) {
-                    currentState = STATE_SEARCH;
-                    Serial.println("1s cumplido → vuelve a BUSCAR");
-                }
-                break;
-        }
-
-        const uint32_t STATE_COLORS[] = { COLOR_SEARCH, COLOR_ADVANCE, COLOR_REVERSE };
-        setLed(STATE_COLORS[currentState]);
+        bool moving = (vx != 0.0f || vy != 0.0f);
+        setLed(moving ? COLOR_MOVING : COLOR_READY);
 
     } else {
+        // ── Toggle OFF o BLE desconectado: detener ────────────────────────────
         setLed(COLOR_IDLE);
     }
 
     // omniDrive asigna targetRPM; updateAllPID cierra el lazo periódicamente
-    omniDrive(vx, vy, w);
+    omniDrive(vx, vy, 0.0f);
     updateAllPID();
 }
