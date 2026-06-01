@@ -267,8 +267,8 @@ static void readDirectionButtons(float& vx, float& vy) {
     vy = 0.0f;
     if (RemoteXY.button_up)    vx += SPEED_MANUAL;
     if (RemoteXY.button_down)  vx -= SPEED_MANUAL;
-    if (RemoteXY.button_right) vy += SPEED_MANUAL;
-    if (RemoteXY.button_left)  vy -= SPEED_MANUAL;
+    if (RemoteXY.button_right) vy -= SPEED_MANUAL;
+    if (RemoteXY.button_left)  vy += SPEED_MANUAL;
 }
 
 // =============================================================================
