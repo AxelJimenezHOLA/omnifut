@@ -29,7 +29,7 @@
 // =============================================================================
 //  Velocidad de traslación manual (fracción de RPM_MAX, rango 0–1)
 // =============================================================================
-#define SPEED_MANUAL    0.60f
+#define SPEED_MANUAL    0.40f
 
 // =============================================================================
 //  Colores LED
@@ -68,7 +68,6 @@ struct Motor {
     uint8_t pwmN;
     uint8_t encoderA;    // canal A (interrupción)
     uint8_t encoderB;    // canal B (dirección, opcional)
-    bool    invertDir;   // true = invertir signo de velocidad objetivo
     MotorPID pid;
 };
 
@@ -80,11 +79,11 @@ enum MotorIndex { FRONT_LEFT = 0, FRONT_RIGHT, BACK_RIGHT, BACK_LEFT };
 //  Ajustar encoderA/B según pines físicos del ESP32 con capacidad de interrupción
 // =============================================================================
 static Motor motors[MOTOR_COUNT] = {
-    // pwmP  pwmN  encA  encB  invertDir  pid (kp, ki, kd)
-    {  1,    2,    4,    5,    false,  {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // FRONT_LEFT
-    {  6,    7,    19,   21,   true,   {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // FRONT_RIGHT
-    { 17,   18,    22,   23,   true,   {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // BACK_RIGHT
-    { 37,   38,    25,   26,   false,  {0,0,0,0,0,0,0,0, 1.2f, 0.05f, 0.02f} }, // BACK_LEFT
+  // pwmP  pwmN  encA  encB  pid (kp, ki, kd)
+  { 2, 1, 4, 5, { 0, 0, 0, 0, 0, 0, 0, 0, 1.2f, 0.05f, 0.02f } },      // FRONT_LEFT
+  { 7, 6, 19, 21, { 0, 0, 0, 0, 0, 0, 0, 0, 1.2f, 0.05f, 0.02f } },    // FRONT_RIGHT
+  { 18, 17, 22, 23, { 0, 0, 0, 0, 0, 0, 0, 0, 1.2f, 0.05f, 0.02f } },  // BACK_RIGHT
+  { 38, 37, 25, 26, { 0, 0, 0, 0, 0, 0, 0, 0, 1.2f, 0.05f, 0.02f } },  // BACK_LEFT
 };
 
 // =============================================================================
@@ -184,6 +183,14 @@ static void updateMotorPID(Motor& m) {
     // RPM real = (ticks / PPR) / tiempo_min
     m.pid.currentRPM = (deltaTicks / (float)PPR) / (dt / 60.0f);
 
+    if (m.pid.targetRPM == 0.0f && fabsf(m.pid.currentRPM) < 0.1f) {
+        m.pid.integral       = 0.0f;
+        m.pid.previousError  = 0.0f;
+        m.pid.pwmOutput      = 0;
+        applyMotorPWM(m, 0);
+        return;
+    }
+
     // Error (en RPM)
     float error = m.pid.targetRPM - m.pid.currentRPM;
 
@@ -236,8 +243,7 @@ static void omniDrive(float vx, float vy, float w) {
 
     // Asignar targetRPM a cada motor (invertir signo según montaje físico)
     for (int i = 0; i < MOTOR_COUNT; i++) {
-        float dir = motors[i].invertDir ? -1.0f : 1.0f;
-        motors[i].pid.targetRPM = dir * raw[i] * RPM_MAX;
+        motors[i].pid.targetRPM = raw[i] * RPM_MAX;
     }
 }
 
@@ -285,7 +291,7 @@ void setup() {
 //  LOOP
 // =============================================================================
 void loop() {
-    RemoteXYEngine.Handler();
+    RemoteXYEngine.handler();
 
     float vx = 0.0f, vy = 0.0f;
 
