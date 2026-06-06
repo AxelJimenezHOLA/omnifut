@@ -357,7 +357,9 @@ void loop() {
                 }
 
                 if (porteriaVistaAlgunaVez) {
-                    float giro = (ultimaPorteriaX > CAM_CENTER_X) ? VEL_BUSQUEDA : -VEL_BUSQUEDA;
+                    // CORRECCIÓN PRINCIPAL: Si la portería estaba a la derecha (> CENTER), 
+                    // necesitamos un giro NEGATIVO para rotar a la derecha.
+                    float giro = (ultimaPorteriaX > CAM_CENTER_X) ? -VEL_BUSQUEDA : VEL_BUSQUEDA;
                     omniDrive(0.0f, 0.0f, giro);
                 } 
                 else {
@@ -375,7 +377,11 @@ void loop() {
                 }
                 
                 if (!stm_s_found) {
-                    omniDrive(VEL_GOL, 0.0f, 0.0f);
+                    // SEGUNDA CORRECCIÓN: Si la perdemos de vista, retrocedemos a BUSCAR_PORTERIA
+                    // en lugar de correr a ciegas e impactar la pared.
+                    estadoActual = BUSCAR_PORTERIA;
+                    resetPIDState();
+                    break;
                 } 
                 else {
                     float errorPorteria = (float)(CAM_CENTER_X - stm_s_cx);
